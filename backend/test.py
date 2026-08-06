@@ -8,6 +8,7 @@ headers = {
     "Authorization": f"Bearer {token}"
 }
 
+# Minor change to test git merge process
 response = requests.get(url, headers=headers)
 
 print(response.status_code)
