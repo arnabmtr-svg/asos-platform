@@ -1,0 +1,666 @@
+"""
+income_engine.py — ATHENA Income Engine · Sprint 1 Foundation
+LAYER 0: Regime Classifier (per index, daily)
+LAYER 1: Strategy Book — 12 arm definitions (A1-A7 positional, B1-B5 intraday)
+LAYER 3: Trade logging schema (calibration activates later once N>=25 per cell)
++ option_positions: REAL position tracking (fixes the fake-P&L defect)
+
+Add to main.py:
+  try: import income_engine
+  except ImportError: income_engine = None
+  # in lifespan: if income_engine: income_engine.init_schema()
+  # after app:   if income_engine: income_engine.register_routes(app)
+"""
+from datetime import datetime, timedelta, date
+import math, json
+
+# ══════════════════════════════════════════════════════════════════════════
+# MARKET STRUCTURE (re-verify each January — NSE/BSE revise)
+# ══════════════════════════════════════════════════════════════════════════
+INDICES = {
+    "NIFTY":     {"kite":"NSE:NIFTY 50",   "lot":65,  "weekly":"TUE", "exch":"NSE", "step":50},
+    "BANKNIFTY": {"kite":"NSE:NIFTY BANK", "lot":30,  "weekly":None,  "exch":"NSE", "step":100},
+    "FINNIFTY":  {"kite":"NSE:NIFTY FIN SERVICE","lot":60,"weekly":None,"exch":"NSE","step":50},
+    "MIDCPNIFTY":{"kite":"NSE:NIFTY MID SELECT","lot":120,"weekly":None,"exch":"NSE","step":25},
+    "SENSEX":    {"kite":"BSE:SENSEX",     "lot":20,  "weekly":"THU", "exch":"BFO","step":100},
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# LAYER 1 — STRATEGY BOOK (12 arms)
+# ══════════════════════════════════════════════════════════════════════════
+ARMS = {
+    # ── Positional (monthly, 30-45 DTE) ──
+    "A1": {"name":"Nifty Monthly Iron Condor","index":"NIFTY","horizon":"positional",
+           "regime":"RANGE","risk":"defined","status":"LIVE",
+           "params":{"short_delta":16,"wing_width":250,"pt_pct":50,"stop_x":2.0,
+                     "adjust_dte":21,"entry_ivr_min":25,"entry_dte":45},
+           "desc":"Sell 16D call+put, wings 250pts. Your proven R-8."},
+    "A2": {"name":"BankNifty Monthly Short Strangle","index":"BANKNIFTY","horizon":"positional",
+           "regime":"RANGE","risk":"undefined","status":"SHADOW",
+           "params":{"short_delta":13,"pt_pct":40,"net_delta_band":0.10,"stop_x":2.0,
+                     "max_lots":2,"entry_ivr_min":50,"entry_dte":30},
+           "desc":"Naked strangle, delta-band hedged. Enable only after A1 stable."},
+    "A3": {"name":"Bull Put Spread","index":"NIFTY","horizon":"positional",
+           "regime":"TREND_UP","risk":"defined","status":"SHADOW",
+           "params":{"short_delta":30,"spread_width":200,"pt_pct":50,"stop_x":2.0,
+                     "entry_ivr_min":30,"entry_dte":35},
+           "desc":"Sell 30D put, buy 12D put. Directional theta up."},
+    "A4": {"name":"Bear Call Spread","index":"NIFTY","horizon":"positional",
+           "regime":"TREND_DOWN","risk":"defined","status":"SHADOW",
+           "params":{"short_delta":30,"spread_width":200,"pt_pct":50,"stop_x":2.0,
+                     "entry_ivr_min":30,"entry_dte":35},
+           "desc":"Mirror of A3 to the upside."},
+    "A5": {"name":"FinNifty Jade Lizard","index":"FINNIFTY","horizon":"positional",
+           "regime":"VOL_EXPANSION","risk":"defined_upside","status":"SHADOW",
+           "params":{"put_delta":20,"call_spread_width":150,"pt_pct":50,"credit_floor_ratio":1.0},
+           "desc":"Credit >= call spread width -> ZERO upside risk. Harvests rich IV."},
+    "A6": {"name":"Nifty Calendar/Diagonal","index":"NIFTY","horizon":"positional",
+           "regime":"VOL_COMPRESSION","risk":"defined","status":"SHADOW",
+           "params":{"strike_offset":0,"front_dte":7,"back_dte":35,"pt_pct":40,"ivr_max":25},
+           "desc":"Long vega. The one arm that WANTS low IVR."},
+    "A7": {"name":"Broken-Wing Butterfly (skew repair)","index":"NIFTY","horizon":"positional",
+           "regime":"ANY","risk":"defined","status":"ADJUSTMENT",
+           "params":{"body_delta":30,"ratio":2,"skew_gate":1.2},
+           "desc":"Standalone in skewed tape + the A1/A3 adjustment parachute."},
+    # ── Intraday / expiry-day (0-2 DTE) ──
+    "B1": {"name":"Nifty Tuesday Expiry Theta","index":"NIFTY","horizon":"intraday",
+           "regime":"RANGE","risk":"managed","status":"SHADOW",
+           "params":{"entry_time":"09:50","strike_offset":0,"mtm_stop":3000,"mtm_target":2000,
+                     "hard_exit_time":"14:45","re_entry":0},
+           "desc":"Short straddle after opening range. Exit before terminal gamma."},
+    "B2": {"name":"Sensex Thursday Expiry Theta","index":"SENSEX","horizon":"intraday",
+           "regime":"RANGE","risk":"managed","status":"SHADOW",
+           "params":{"entry_time":"09:50","strike_offset":0,"mtm_stop":3000,"mtm_target":2000,
+                     "hard_exit_time":"14:45","re_entry":0},
+           "desc":"Second UNCORRELATED weekly theta window (BSE Thursday)."},
+    "B3": {"name":"Opening Range Breakout","index":"NIFTY","horizon":"intraday",
+           "regime":"TREND_UP","risk":"defined","status":"SHADOW",
+           "params":{"range_minutes":30,"atr_stop_x":1.5,"target_r":2.0,"trail_method":"atr"},
+           "desc":"Buy ATM option on confirmed ORB. ATR stop, trail."},
+    "B4": {"name":"VWAP Mean-Reversion Scalp","index":"NIFTY","horizon":"intraday",
+           "regime":"RANGE","risk":"defined","status":"SHADOW",
+           "params":{"band_sigma":2.0,"stop_ticks":15,"target_ticks":25,"max_trades_day":3},
+           "desc":"Fade stretched moves to VWAP. Non-expiry days."},
+    "B5": {"name":"Gap Fade","index":"NIFTY","horizon":"intraday",
+           "regime":"VOL_EXPANSION","risk":"defined","status":"SHADOW",
+           "params":{"min_gap_pct":0.6,"fade_fraction":0.5,"invalidate_atr_x":1.0},
+           "desc":"Fade non-trend gap opens toward prior close."},
+}
+
+REGIME_ARMS = {
+    "RANGE":            {"positional":["A1","A2"], "intraday":["B1","B2","B4"]},
+    "TREND_UP":         {"positional":["A3"],      "intraday":["B3"]},
+    "TREND_DOWN":       {"positional":["A4"],      "intraday":["B3"]},
+    "VOL_EXPANSION":    {"positional":["A5"],      "intraday":["B3","B5"]},
+    "VOL_COMPRESSION":  {"positional":["A6"],      "intraday":["B4"]},
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# SCHEMA
+# ══════════════════════════════════════════════════════════════════════════
+def init_schema():
+    from database import get_db
+    db = get_db()
+    db.executescript("""
+    -- REAL position tracking (fixes fake-P&L defect TM-2/TM-3)
+    CREATE TABLE IF NOT EXISTS option_positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, arm_code TEXT, idx TEXT,
+        structure TEXT,               -- IC | STRANGLE | BPS | BCS | JL | CAL | BWB | STRADDLE
+        legs_json TEXT,               -- [{type:CE/PE, action:SELL/BUY, strike, qty, entry_px}]
+        expiry TEXT, entry_dte INTEGER,
+        entry_ts TEXT, exit_ts TEXT,
+        credit_received REAL, capital_at_risk REAL, lots INTEGER,
+        regime_at_entry TEXT, feature_snapshot TEXT, params_used TEXT,
+        greeks_at_entry TEXT,
+        pt_target REAL, stop_loss REAL,
+        status TEXT DEFAULT 'OPEN',   -- OPEN | CLOSED | ADJUSTED
+        exit_reason TEXT, gross_pnl REAL, costs REAL, net_pnl REAL, r_multiple REAL,
+        mode TEXT DEFAULT 'PAPER',    -- PAPER | LIVE
+        notes TEXT DEFAULT ''
+    );
+    -- Regime log (Layer 0 output, per index per day)
+    CREATE TABLE IF NOT EXISTS regime_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        idx TEXT, log_date TEXT, regime TEXT, confidence REAL,
+        features_json TEXT, created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(idx, log_date)
+    );
+    -- Layer 3 performance cells — (arm x regime), decayed
+    CREATE TABLE IF NOT EXISTS arm_cells (
+        arm_code TEXT, regime TEXT,
+        n INTEGER DEFAULT 0, wins INTEGER DEFAULT 0,
+        sum_r REAL DEFAULT 0, sum_win_r REAL DEFAULT 0, sum_loss_r REAL DEFAULT 0,
+        expectancy REAL DEFAULT 0, win_rate REAL DEFAULT 0,
+        max_dd REAL DEFAULT 0, updated_at TEXT,
+        PRIMARY KEY (arm_code, regime)
+    );
+    -- Arm lifecycle state (Layer 6 prep)
+    CREATE TABLE IF NOT EXISTS arm_state (
+        arm_code TEXT PRIMARY KEY,
+        lifecycle TEXT DEFAULT 'SHADOW',   -- CANDIDATE|SHADOW|LIVE|PROBATION|RETIRED
+        weight REAL DEFAULT 0.0,
+        params_json TEXT, enabled INTEGER DEFAULT 0,
+        updated_at TEXT
+    );
+    -- Capital sleeves (your answer: dynamic Equity/Options/Cash by performance)
+    CREATE TABLE IF NOT EXISTS capital_sleeves (
+        user_id INTEGER PRIMARY KEY,
+        options_capital REAL DEFAULT 500000,
+        equity_capital REAL DEFAULT 0,
+        cash_reserve REAL DEFAULT 0,
+        options_target_pct REAL DEFAULT 100,
+        last_rebalanced TEXT, updated_at TEXT
+    );
+    """)
+    # seed arm_state
+    for code, a in ARMS.items():
+        db.execute("""INSERT OR IGNORE INTO arm_state (arm_code,lifecycle,weight,params_json,enabled,updated_at)
+                      VALUES (?,?,?,?,?,datetime('now'))""",
+                   (code, a["status"], 1.0 if a["status"]=="LIVE" else 0.0,
+                    json.dumps(a["params"]), 1 if a["status"]=="LIVE" else 0))
+    db.commit()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# LAYER 0 — REGIME CLASSIFIER
+# ══════════════════════════════════════════════════════════════════════════
+def _ohlc(index_key, days=250, user_id=None):
+    """Fetch OHLC bars via Kite for feature computation."""
+    try:
+        from kite_data_patch import _kite, _token_map
+        k = _kite(user_id)
+        if not k: return []
+        cfg = INDICES.get(index_key)
+        if not cfg: return []
+        # index historical needs the index instrument token
+        sym = cfg["kite"].split(":")[1]
+        tm = _token_map(k)
+        tok = tm.get(sym)
+        if not tok:
+            # try quote-based token
+            try:
+                q = k.quote([cfg["kite"]])
+                tok = q[cfg["kite"]]["instrument_token"]
+            except Exception:
+                return []
+        data = k.historical_data(tok, datetime.now()-timedelta(days=days), datetime.now(), "day")
+        return data or []
+    except Exception as e:
+        print(f"OHLC error {index_key}: {e}")
+        return []
+
+
+def _ema(vals, period):
+    if len(vals) < period: return None
+    k = 2/(period+1); e = sum(vals[:period])/period
+    for v in vals[period:]: e = v*k + e*(1-k)
+    return e
+
+def _atr_pct(bars, period=14):
+    if len(bars) < period+1: return None
+    trs = []
+    for i in range(1, len(bars)):
+        h,l,pc = bars[i]["high"], bars[i]["low"], bars[i-1]["close"]
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    atr = sum(trs[-period:])/period
+    spot = bars[-1]["close"]
+    return round(atr/spot*100, 2) if spot else None
+
+def _adx(bars, period=14):
+    if len(bars) < period*2: return None
+    plus_dm, minus_dm, trs = [], [], []
+    for i in range(1, len(bars)):
+        up = bars[i]["high"] - bars[i-1]["high"]
+        dn = bars[i-1]["low"] - bars[i]["low"]
+        plus_dm.append(up if (up > dn and up > 0) else 0)
+        minus_dm.append(dn if (dn > up and dn > 0) else 0)
+        h,l,pc = bars[i]["high"], bars[i]["low"], bars[i-1]["close"]
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    def smooth(x):
+        s = sum(x[:period]); out=[s]
+        for v in x[period:]:
+            s = s - s/period + v; out.append(s)
+        return out
+    str_, spdm, smdm = smooth(trs), smooth(plus_dm), smooth(minus_dm)
+    dxs = []
+    for i in range(len(str_)):
+        if str_[i] == 0: continue
+        pdi = 100*spdm[i]/str_[i]; mdi = 100*smdm[i]/str_[i]
+        if pdi+mdi == 0: continue
+        dxs.append(100*abs(pdi-mdi)/(pdi+mdi))
+    if len(dxs) < period: return None
+    return round(sum(dxs[-period:])/period, 1)
+
+def _bbw_pct(closes, period=20, lookback=250):
+    """Bollinger band-width percentile over trailing year."""
+    if len(closes) < period+20: return None
+    widths = []
+    for i in range(period, len(closes)):
+        w = closes[i-period:i]
+        m = sum(w)/period
+        sd = math.sqrt(sum((x-m)**2 for x in w)/period)
+        widths.append((4*sd)/m*100 if m else 0)
+    if not widths: return None
+    cur = widths[-1]
+    hist = widths[-lookback:] if len(widths) > lookback else widths
+    below = sum(1 for x in hist if x < cur)
+    return round(below/len(hist)*100, 1)
+
+def _realized_vol(closes, days=10):
+    if len(closes) < days+1: return None
+    rets = [math.log(closes[i]/closes[i-1]) for i in range(len(closes)-days, len(closes))]
+    if not rets: return None
+    m = sum(rets)/len(rets)
+    sd = math.sqrt(sum((r-m)**2 for r in rets)/len(rets))
+    return round(sd*math.sqrt(252)*100, 2)
+
+
+def compute_features(index_key="NIFTY", user_id=None) -> dict:
+    """All Layer-0 features for one index."""
+    bars = _ohlc(index_key, 250, user_id)
+    if not bars or len(bars) < 30:
+        return {"error":"insufficient data","index":index_key}
+    closes = [b["close"] for b in bars]
+    spot = closes[-1]
+    try:
+        from kite_data_patch import compute_ivp_ivr
+        iv = compute_ivp_ivr(user_id)
+    except Exception:
+        iv = {"vix":14.0,"ivp":50,"ivr":50}
+    from kite_data_patch import _rsi as _krsi
+
+    ema20 = _ema(closes, 20); ema50 = _ema(closes, 50)
+    ema20_prev = _ema(closes[:-3], 20) if len(closes) > 23 else ema20
+    rv10 = _realized_vol(closes, 10)
+    atm_iv = iv["vix"]   # proxy — real ATM IV from chain in Layer 5
+
+    # event flag from athena_market events
+    event_flag = False; event_name = ""
+    try:
+        import athena_market
+        evs = athena_market.compute_events(5, horizon_days=3)
+        hi = [e for e in evs if e["impact"]=="HIGH" and e["days_away"] <= 2]
+        if hi: event_flag = True; event_name = hi[0]["title"]
+    except Exception: pass
+
+    return {
+        "index": index_key, "spot": round(spot,1),
+        "ivp": iv["ivp"], "ivr": iv["ivr"], "vix": iv["vix"],
+        "adx": _adx(bars), "rsi": _krsi(closes),
+        "ema20": round(ema20,1) if ema20 else None,
+        "ema50": round(ema50,1) if ema50 else None,
+        "ema20_slope_up": (ema20 > ema20_prev) if (ema20 and ema20_prev) else None,
+        "atr_pct": _atr_pct(bars), "bbw_pct": _bbw_pct(closes),
+        "rv10": rv10, "atm_iv": atm_iv,
+        "vrp": round(atm_iv - rv10, 2) if rv10 else None,   # vol risk premium
+        "event_flag": event_flag, "event_name": event_name,
+        "computed_at": datetime.now().isoformat(),
+    }
+
+
+def classify_regime(feat: dict) -> dict:
+    """Priority order — first match wins. Returns regime + confidence + why."""
+    if feat.get("error"):
+        return {"regime":"UNKNOWN","confidence":0,"why":feat["error"]}
+    ivr = feat.get("ivr") or 50
+    adx = feat.get("adx") or 15
+    rsi = feat.get("rsi") or 50
+    spot = feat.get("spot") or 0
+    e20 = feat.get("ema20") or spot
+    e50 = feat.get("ema50") or spot
+    slope_up = feat.get("ema20_slope_up")
+    bbw = feat.get("bbw_pct") or 50
+    rv10 = feat.get("rv10"); atm_iv = feat.get("atm_iv") or 14
+    event = feat.get("event_flag")
+
+    # 1. VOL_EXPANSION
+    if ivr >= 60 or (rv10 and rv10 > atm_iv) or event:
+        why = []
+        if ivr >= 60: why.append(f"IVR {ivr}>=60")
+        if rv10 and rv10 > atm_iv: why.append(f"RV10 {rv10}>IV {atm_iv}")
+        if event: why.append(f"Event: {feat.get('event_name','')}")
+        return {"regime":"VOL_EXPANSION","confidence":min(95, 60+ivr*0.3),
+                "why":" · ".join(why),
+                "intent":"Reduce size, widen strikes, prefer long-vega/defined-risk"}
+    # 2. TREND_UP
+    if adx >= 25 and spot > e20 > e50 and slope_up:
+        return {"regime":"TREND_UP","confidence":min(95, 50+adx),
+                "why":f"ADX {adx}>=25 · spot>EMA20>EMA50 · slope up",
+                "intent":"Directional theta up — bull put spreads, momentum longs"}
+    # 3. TREND_DOWN
+    if adx >= 25 and spot < e20 < e50 and slope_up is False:
+        return {"regime":"TREND_DOWN","confidence":min(95, 50+adx),
+                "why":f"ADX {adx}>=25 · spot<EMA20<EMA50 · slope down",
+                "intent":"Bear call spreads, momentum shorts"}
+    # 4. VOL_COMPRESSION
+    if ivr <= 25 and bbw <= 20:
+        return {"regime":"VOL_COMPRESSION","confidence":min(90, 60+(25-ivr)),
+                "why":f"IVR {ivr}<=25 · BBW pct {bbw}<=20",
+                "intent":"Long-vega structures (calendars). AVOID naked short premium"}
+    # 5. RANGE (fallback)
+    return {"regime":"RANGE","confidence":70 if adx < 20 else 55,
+            "why":f"ADX {adx} · IVR {ivr} · no event — default theta harvest",
+            "intent":"Core theta harvesting — condors, strangles, expiry straddles"}
+
+
+def get_regime(index_key="NIFTY", user_id=None, store=True) -> dict:
+    feat = compute_features(index_key, user_id)
+    reg = classify_regime(feat)
+    result = {**reg, "features": feat, "index": index_key}
+    if store and not feat.get("error"):
+        try:
+            from database import get_db
+            db = get_db()
+            db.execute("""INSERT OR REPLACE INTO regime_log (idx,log_date,regime,confidence,features_json)
+                          VALUES (?,?,?,?,?)""",
+                       (index_key, date.today().isoformat(), reg["regime"],
+                        reg["confidence"], json.dumps(feat)))
+            db.commit()
+        except Exception: pass
+    return result
+
+
+def armed_arms(regime: str) -> dict:
+    """Which arms the current regime arms."""
+    cfg = REGIME_ARMS.get(regime, {"positional":[],"intraday":[]})
+    out = {"positional":[], "intraday":[]}
+    for horizon in ("positional","intraday"):
+        for code in cfg.get(horizon, []):
+            a = ARMS[code]
+            out[horizon].append({"code":code, **{k:v for k,v in a.items() if k!="params"},
+                                 "params":a["params"]})
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# POSITION TRACKING — real P&L (fixes TM-2/TM-3 fake data defect)
+# ══════════════════════════════════════════════════════════════════════════
+def _leg_ltp(k, index_key, expiry, strike, opt_type):
+    """Live LTP for one option leg via Kite."""
+    try:
+        cfg = INDICES[index_key]
+        # Kite tradingsymbol: NIFTY26JUL24000CE  (expiry fmt varies; try both)
+        d = datetime.strptime(expiry, "%Y-%m-%d")
+        sym1 = f"{index_key}{d.strftime('%y%b').upper()}{int(strike)}{opt_type}"
+        exch = "NFO" if cfg["exch"] in ("NSE","NFO") else "BFO"
+        q = k.quote([f"{exch}:{sym1}"])
+        if q: return list(q.values())[0]["last_price"]
+    except Exception: pass
+    return None
+
+
+def position_pnl(pos: dict, user_id=None) -> dict:
+    """Compute LIVE P&L for an open position from current chain prices."""
+    from kite_data_patch import _kite
+    k = _kite(user_id)
+    legs = json.loads(pos["legs_json"])
+    cur_val, ok = 0.0, True
+    for leg in legs:
+        ltp = _leg_ltp(k, pos["idx"], pos["expiry"], leg["strike"], leg["type"]) if k else None
+        if ltp is None: ok = False; ltp = leg.get("entry_px", 0)
+        leg["ltp"] = ltp
+        sign = -1 if leg["action"] == "SELL" else 1
+        cur_val += sign * ltp * leg["qty"]
+    entry_val = sum((-1 if l["action"]=="SELL" else 1)*l["entry_px"]*l["qty"] for l in legs)
+    pnl = entry_val - cur_val if pos["structure"] in ("IC","STRANGLE","BPS","BCS","JL","STRADDLE") \
+          else cur_val - entry_val
+    credit = pos.get("credit_received") or 1
+    pct = round(pnl/abs(credit)*100, 1) if credit else 0
+    dte = (datetime.strptime(pos["expiry"], "%Y-%m-%d").date() - date.today()).days
+    # trigger checks
+    triggers = []
+    if pos.get("pt_target") and pnl >= pos["pt_target"]:
+        triggers.append({"type":"PROFIT_TARGET","action":"CLOSE — target hit","urgency":"HIGH"})
+    if pos.get("stop_loss") and pnl <= -abs(pos["stop_loss"]):
+        triggers.append({"type":"STOP_LOSS","action":"CLOSE NOW — stop breached","urgency":"CRITICAL"})
+    params = json.loads(pos.get("params_used") or "{}")
+    adj_dte = params.get("adjust_dte", 21)
+    if dte <= adj_dte and pct < (params.get("pt_pct",50)):
+        triggers.append({"type":"DTE_ADVISORY",
+                         "action":f"DTE {dte} <= {adj_dte} and not at target — consider close/roll (advisory)",
+                         "urgency":"MEDIUM"})
+    if dte <= 1:
+        triggers.append({"type":"TIME_STOP","action":"Expiry tomorrow — close, gamma risk","urgency":"HIGH"})
+    return {"pnl": round(pnl,0), "pnl_pct": pct, "dte": dte, "legs": legs,
+            "current_value": round(cur_val,0), "live": ok, "triggers": triggers}
+
+
+def update_cell(arm_code, regime, r_multiple, is_win):
+    """Layer 3 — update the (arm x regime) performance cell with decay."""
+    from database import get_db
+    db = get_db()
+    row = db.execute("SELECT * FROM arm_cells WHERE arm_code=? AND regime=?",
+                     (arm_code, regime)).fetchone()
+    DECAY = 0.97   # half-life ~23 trades
+    if row:
+        n = row["n"]*DECAY + 1
+        wins = row["wins"]*DECAY + (1 if is_win else 0)
+        sum_r = row["sum_r"]*DECAY + r_multiple
+        sum_win = row["sum_win_r"]*DECAY + (r_multiple if is_win else 0)
+        sum_loss = row["sum_loss_r"]*DECAY + (0 if is_win else abs(r_multiple))
+    else:
+        n, wins = 1, (1 if is_win else 0)
+        sum_r = r_multiple
+        sum_win = r_multiple if is_win else 0
+        sum_loss = 0 if is_win else abs(r_multiple)
+    win_rate = wins/n if n else 0
+    avg_win = sum_win/wins if wins else 0
+    losses = n - wins
+    avg_loss = sum_loss/losses if losses > 0 else 0
+    expectancy = win_rate*avg_win - (1-win_rate)*avg_loss
+    db.execute("""INSERT INTO arm_cells (arm_code,regime,n,wins,sum_r,sum_win_r,sum_loss_r,
+                    expectancy,win_rate,updated_at)
+                  VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))
+                  ON CONFLICT(arm_code,regime) DO UPDATE SET
+                    n=excluded.n, wins=excluded.wins, sum_r=excluded.sum_r,
+                    sum_win_r=excluded.sum_win_r, sum_loss_r=excluded.sum_loss_r,
+                    expectancy=excluded.expectancy, win_rate=excluded.win_rate,
+                    updated_at=excluded.updated_at""",
+               (arm_code, regime, n, wins, sum_r, sum_win, sum_loss, expectancy, win_rate))
+    db.commit()
+    return {"n":round(n,1), "win_rate":round(win_rate*100,1), "expectancy":round(expectancy,3)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ROUTES
+# ══════════════════════════════════════════════════════════════════════════
+def register_routes(app):
+    from fastapi import Depends, HTTPException
+    from auth import get_current_user
+    from database import get_db
+
+    # ── LAYER 0 ──────────────────────────────────────────────────────────
+    @app.get("/income/regime")
+    async def regime_now(index: str = "NIFTY", current_user=Depends(get_current_user)):
+        r = get_regime(index.upper(), current_user["id"])
+        r["armed_arms"] = armed_arms(r["regime"])
+        return r
+
+    @app.get("/income/regime-all")
+    async def regime_all(current_user=Depends(get_current_user)):
+        out = {}
+        for idx in ("NIFTY","BANKNIFTY"):
+            try:
+                r = get_regime(idx, current_user["id"])
+                out[idx] = {"regime":r["regime"],"confidence":r["confidence"],
+                            "why":r["why"],"intent":r.get("intent","")}
+            except Exception as e:
+                out[idx] = {"regime":"ERROR","why":str(e)[:80]}
+        return {"regimes": out, "generated_at": datetime.now().isoformat()}
+
+    # ── LAYER 1 ──────────────────────────────────────────────────────────
+    @app.get("/income/arms")
+    async def list_arms(current_user=Depends(get_current_user)):
+        db = get_db()
+        states = {r["arm_code"]: dict(r) for r in db.execute("SELECT * FROM arm_state").fetchall()}
+        cells = {}
+        for r in db.execute("SELECT * FROM arm_cells").fetchall():
+            cells.setdefault(r["arm_code"], []).append(dict(r))
+        out = []
+        for code, a in ARMS.items():
+            st = states.get(code, {})
+            out.append({"code":code, **{k:v for k,v in a.items() if k!="params"},
+                        "params":a["params"],
+                        "lifecycle":st.get("lifecycle", a["status"]),
+                        "weight":st.get("weight",0),
+                        "enabled":bool(st.get("enabled",0)),
+                        "cells":cells.get(code,[])})
+        return {"arms": out, "regime_map": REGIME_ARMS}
+
+    @app.post("/income/arms/{code}/state")
+    async def set_arm_state(code: str, data: dict, current_user=Depends(get_current_user)):
+        code = code.upper()
+        if code not in ARMS: raise HTTPException(404, "unknown arm")
+        lc = data.get("lifecycle")
+        if lc not in ("CANDIDATE","SHADOW","LIVE","PROBATION","RETIRED"):
+            raise HTTPException(400, "bad lifecycle")
+        db = get_db()
+        db.execute("""UPDATE arm_state SET lifecycle=?, enabled=?, weight=?, updated_at=datetime('now')
+                      WHERE arm_code=?""",
+                   (lc, 1 if lc=="LIVE" else 0, data.get("weight", 1.0 if lc=="LIVE" else 0.0), code))
+        db.commit()
+        return {"message": f"{code} -> {lc}"}
+
+    # ── POSITIONS ────────────────────────────────────────────────────────
+    @app.get("/income/positions")
+    async def positions(current_user=Depends(get_current_user)):
+        db = get_db()
+        rows = db.execute("""SELECT * FROM option_positions WHERE user_id=? AND status='OPEN'
+                             ORDER BY entry_ts DESC""", (current_user["id"],)).fetchall()
+        out = []
+        for r in rows:
+            p = dict(r)
+            try: p.update(position_pnl(p, current_user["id"]))
+            except Exception as e: p["pnl_error"] = str(e)[:60]
+            out.append(p)
+        # MTD real income (from closed positions)
+        ms = date.today().replace(day=1).isoformat()
+        mtd = db.execute("""SELECT COALESCE(SUM(net_pnl),0) s, COUNT(*) c FROM option_positions
+                            WHERE user_id=? AND status='CLOSED' AND exit_ts>=?""",
+                         (current_user["id"], ms)).fetchone()
+        return {"positions": out, "open_count": len(out),
+                "mtd_income": round(mtd["s"] or 0, 0), "mtd_closed": mtd["c"],
+                "generated_at": datetime.now().isoformat()}
+
+    @app.post("/income/deploy")
+    async def deploy(data: dict, current_user=Depends(get_current_user)):
+        """
+        Log a position (PAPER or LIVE). Body: {arm_code, index, structure, legs,
+        expiry, credit, capital_at_risk, lots, mode}
+        Captures regime + features snapshot for Layer 3 calibration.
+        """
+        uid = current_user["id"]; db = get_db()
+        code = data.get("arm_code","A1").upper()
+        idx  = data.get("index","NIFTY").upper()
+        reg  = get_regime(idx, uid, store=False)
+        arm  = ARMS.get(code, ARMS["A1"])
+        credit = float(data.get("credit", 0))
+        car = float(data.get("capital_at_risk", credit*2))
+        params = arm["params"]
+        expiry = data.get("expiry", "")
+        dte = (datetime.strptime(expiry,"%Y-%m-%d").date()-date.today()).days if expiry else 0
+        db.execute("""INSERT INTO option_positions
+            (user_id,arm_code,idx,structure,legs_json,expiry,entry_dte,entry_ts,
+             credit_received,capital_at_risk,lots,regime_at_entry,feature_snapshot,
+             params_used,pt_target,stop_loss,status,mode)
+            VALUES (?,?,?,?,?,?,?,datetime('now'),?,?,?,?,?,?,?,?, 'OPEN',?)""",
+            (uid, code, idx, data.get("structure","IC"),
+             json.dumps(data.get("legs",[])), expiry, dte,
+             credit, car, int(data.get("lots",1)),
+             reg["regime"], json.dumps(reg.get("features",{})), json.dumps(params),
+             credit*params.get("pt_pct",50)/100, credit*params.get("stop_x",2.0),
+             data.get("mode","PAPER")))
+        db.commit()
+        return {"message": f"{code} {data.get('structure','IC')} logged ({data.get('mode','PAPER')})",
+                "regime_at_entry": reg["regime"],
+                "pt_target": round(credit*params.get("pt_pct",50)/100,0),
+                "stop_loss": round(credit*params.get("stop_x",2.0),0)}
+
+    @app.post("/income/positions/{pid}/close")
+    async def close_position(pid: int, data: dict, current_user=Depends(get_current_user)):
+        """Close + feed Layer 3 cell + log income to cash ledger."""
+        uid = current_user["id"]; db = get_db()
+        r = db.execute("SELECT * FROM option_positions WHERE id=? AND user_id=?", (pid,uid)).fetchone()
+        if not r: raise HTTPException(404, "position not found")
+        p = dict(r)
+        gross = float(data.get("gross_pnl", 0))
+        costs = float(data.get("costs", abs(gross)*0.02))
+        net = gross - costs
+        car = p["capital_at_risk"] or 1
+        rmul = round(net/car, 3)
+        db.execute("""UPDATE option_positions SET status='CLOSED', exit_ts=datetime('now'),
+                      exit_reason=?, gross_pnl=?, costs=?, net_pnl=?, r_multiple=?
+                      WHERE id=?""",
+                   (data.get("exit_reason","manual"), gross, costs, net, rmul, pid))
+        db.commit()
+        cell = update_cell(p["arm_code"], p["regime_at_entry"], rmul, net > 0)
+        # income -> cash ledger (feeds Earnings Tracker)
+        if p["mode"] == "LIVE" and net != 0:
+            try:
+                db.execute("""INSERT INTO cash_ledger (user_id,entry_date,description,amount,
+                              entry_type,status) VALUES (?,?,?,?,'option_income','credited')""",
+                           (uid, date.today().isoformat(),
+                            f"{p['arm_code']} {p['structure']} {p['idx']} closed", net))
+                db.commit()
+            except Exception: pass
+        return {"message":"closed","net_pnl":round(net,0),"r_multiple":rmul,"cell":cell}
+
+    # ── CAPITAL SLEEVES (your answer: dynamic by performance) ─────────────
+    @app.get("/income/sleeves")
+    async def sleeves(current_user=Depends(get_current_user)):
+        uid = current_user["id"]; db = get_db()
+        r = db.execute("SELECT * FROM capital_sleeves WHERE user_id=?", (uid,)).fetchone()
+        if not r:
+            db.execute("INSERT INTO capital_sleeves (user_id,options_capital,updated_at) VALUES (?,500000,datetime('now'))",(uid,))
+            db.commit()
+            r = db.execute("SELECT * FROM capital_sleeves WHERE user_id=?", (uid,)).fetchone()
+        s = dict(r)
+        # performance-based suggestion
+        ms = (date.today().replace(day=1) - timedelta(days=90)).isoformat()
+        perf = db.execute("""SELECT COALESCE(SUM(net_pnl),0) pnl, COUNT(*) n,
+                             COALESCE(AVG(r_multiple),0) avg_r FROM option_positions
+                             WHERE user_id=? AND status='CLOSED' AND mode='LIVE' AND exit_ts>=?""",
+                          (uid, ms)).fetchone()
+        n = perf["n"] or 0; avg_r = perf["avg_r"] or 0
+        if n < 10:
+            sug = {"action":"HOLD","reason":f"Only {n} closed trades — need 10+ before resizing","new_options_capital":s["options_capital"]}
+        elif avg_r > 0.15:
+            sug = {"action":"INCREASE","reason":f"Avg R {avg_r:.2f} strong over {n} trades — scale options sleeve +20%",
+                   "new_options_capital": round(s["options_capital"]*1.2,0)}
+        elif avg_r < -0.05:
+            sug = {"action":"REDUCE","reason":f"Avg R {avg_r:.2f} negative over {n} trades — cut options sleeve 30%, move to cash",
+                   "new_options_capital": round(s["options_capital"]*0.7,0)}
+        else:
+            sug = {"action":"HOLD","reason":f"Avg R {avg_r:.2f} neutral — maintain","new_options_capital":s["options_capital"]}
+        s["performance_90d"] = {"net_pnl":round(perf["pnl"] or 0,0),"trades":n,"avg_r":round(avg_r,3)}
+        s["suggestion"] = sug
+        return s
+
+    @app.post("/income/sleeves")
+    async def set_sleeves(data: dict, current_user=Depends(get_current_user)):
+        db = get_db()
+        db.execute("""INSERT INTO capital_sleeves (user_id,options_capital,equity_capital,
+                      cash_reserve,updated_at) VALUES (?,?,?,?,datetime('now'))
+                      ON CONFLICT(user_id) DO UPDATE SET
+                      options_capital=excluded.options_capital,
+                      equity_capital=excluded.equity_capital,
+                      cash_reserve=excluded.cash_reserve, updated_at=datetime('now')""",
+                   (current_user["id"], float(data.get("options_capital",500000)),
+                    float(data.get("equity_capital",0)), float(data.get("cash_reserve",0))))
+        db.commit()
+        return {"message":"sleeves updated"}
+
+    # ── LAYER 3 status (calibration readiness) ───────────────────────────
+    @app.get("/income/calibration")
+    async def calibration(current_user=Depends(get_current_user)):
+        db = get_db()
+        cells = [dict(r) for r in db.execute("SELECT * FROM arm_cells ORDER BY arm_code").fetchall()]
+        N_MIN = 25
+        ready = [c for c in cells if c["n"] >= N_MIN and c["expectancy"] > 0]
+        return {"cells": cells, "n_min": N_MIN,
+                "cells_ready": len(ready), "cells_total": len(cells),
+                "status": "CALIBRATING" if ready else "COLLECTING DATA",
+                "message": (f"{len(ready)} arm-regime cells have N>={N_MIN} and positive expectancy — live sizing active"
+                            if ready else
+                            f"No cell has {N_MIN}+ trades yet. Log first, learn later — all arms in SHADOW except A1.")}

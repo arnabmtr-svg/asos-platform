@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ASOS Wealth Platform — Sign in</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#05070a;--s1:#0a0d13;--s2:#0f1420;--s3:#151c2a;
+  --b1:#202c40;--b2:#2a3a52;
+  --tx:#d0d8ef;--t2:#7888a8;--t3:#3d4f6a;
+  --gr:#18d490;--gd:#051b0f;
+  --bl:#4080ff;--bd:#0b1d44;
+  --re:#f03050;
+  --r:8px;--r2:14px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--tx);font-family:'Space Grotesk',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;overflow:hidden}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 60% 50% at 50% -10%,rgba(64,128,255,.12),transparent);pointer-events:none}
+
+.card{background:var(--s1);border:1px solid var(--b1);border-radius:20px;padding:40px;width:min(420px,94vw);position:relative;z-index:1}
+.logo{display:flex;align-items:center;gap:12px;margin-bottom:32px;justify-content:center}
+.lmark{width:40px;height:40px;background:linear-gradient(135deg,#4080ff,#00b8e0);border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:18px;color:#fff}
+.lname{font-size:20px;font-weight:800;letter-spacing:-.03em}
+.lsub{font-size:10px;color:var(--t3);font-family:'IBM Plex Mono',monospace;letter-spacing:.06em}
+
+.tabs{display:flex;gap:4px;background:var(--s2);border-radius:10px;padding:4px;margin-bottom:28px}
+.tab{flex:1;padding:8px;border:none;background:transparent;color:var(--t3);font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;border-radius:7px;cursor:pointer;transition:all .2s}
+.tab.on{background:var(--s1);color:var(--tx);border:1px solid var(--b1)}
+
+.field{margin-bottom:16px}
+.field label{display:block;font-size:11px;font-weight:600;color:var(--t3);font-family:'IBM Plex Mono',monospace;text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px}
+.field input{width:100%;background:var(--s2);border:1px solid var(--b1);border-radius:var(--r);padding:12px 14px;color:var(--tx);font-size:14px;font-family:'Space Grotesk',sans-serif;outline:none;transition:border-color .2s}
+.field input:focus{border-color:var(--bl)}
+
+.btn{width:100%;padding:14px;border-radius:var(--r2);border:none;background:linear-gradient(135deg,var(--bl),#00b8e0);color:#fff;font-size:14px;font-weight:700;cursor:pointer;font-family:'Space Grotesk',sans-serif;transition:opacity .2s;margin-top:6px}
+.btn:hover{opacity:.88}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+
+.divider{display:flex;align-items:center;gap:12px;margin:20px 0;color:var(--t3);font-size:12px}
+.divider::before,.divider::after{content:'';flex:1;height:1px;background:var(--b1)}
+
+.demo-btn{width:100%;padding:12px;border-radius:var(--r2);border:1px solid var(--b1);background:var(--s2);color:var(--t2);font-size:13px;font-weight:600;cursor:pointer;font-family:'Space Grotesk',sans-serif;transition:all .2s}
+.demo-btn:hover{border-color:var(--gr);color:var(--gr)}
+
+.msg{padding:10px 12px;border-radius:var(--r);font-size:12px;margin-top:12px;display:none}
+.msg.err{background:var(--re);background:rgba(240,48,80,.12);border:1px solid rgba(240,48,80,.25);color:var(--re)}
+.msg.ok{background:rgba(24,212,144,.1);border:1px solid rgba(24,212,144,.25);color:var(--gr)}
+.msg.visible{display:block}
+
+.footer{text-align:center;margin-top:24px;font-size:11px;color:var(--t3)}
+.footer a{color:var(--bl);text-decoration:none}
+
+/* ZERODHA CONNECT */
+.kite-section{background:var(--s2);border:1px solid rgba(245,166,35,.2);border-radius:var(--r2);padding:14px 16px;margin-top:20px;display:none}
+.kite-section.visible{display:block}
+.kite-head{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;margin-bottom:10px}
+.kite-status{font-size:11px;font-family:'IBM Plex Mono',monospace;padding:2px 8px;border-radius:4px}
+.ks-no{background:rgba(240,48,80,.1);color:var(--re);border:1px solid rgba(240,48,80,.25)}
+.ks-yes{background:rgba(24,212,144,.1);color:var(--gr);border:1px solid rgba(24,212,144,.25)}
+.kite-fields{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
+.kite-btn{padding:9px 14px;border-radius:var(--r);border:1px solid rgba(245,166,35,.4);background:rgba(245,166,35,.08);color:#f0a500;font-size:12px;font-weight:700;cursor:pointer;font-family:'Space Grotesk',sans-serif;transition:all .2s;width:100%}
+.kite-btn:hover{background:rgba(245,166,35,.15)}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <div class="lmark">A</div>
+    <div>
+      <div class="lname">ASOS Wealth</div>
+      <div class="lsub">SOVEREIGN PLATFORM v1.0</div>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab on" id="tabLogin"    onclick="showTab('login')">Sign in</button>
+    <button class="tab"    id="tabRegister" onclick="showTab('register')">Create account</button>
+  </div>
+
+  <!-- LOGIN FORM -->
+  <div id="loginForm">
+    <div class="field"><label>Email</label><input type="email" id="lEmail" placeholder="you@example.com" autocomplete="email"></div>
+    <div class="field"><label>Password</label><input type="password" id="lPass" placeholder="••••••••" autocomplete="current-password"></div>
+    <button class="btn" onclick="doLogin()" id="loginBtn">Sign in →</button>
+    <div class="divider">or</div>
+    <button class="demo-btn" onclick="demoLogin()">⚡ Try demo account (no sign-up needed)</button>
+  </div>
+
+  <!-- REGISTER FORM -->
+  <div id="registerForm" style="display:none">
+    <div class="field"><label>Full name</label><input type="text" id="rName" placeholder="Arnab Roy"></div>
+    <div class="field"><label>Email</label><input type="email" id="rEmail" placeholder="you@example.com" autocomplete="email"></div>
+    <div class="field"><label>Password</label><input type="password" id="rPass" placeholder="Min 8 characters" autocomplete="new-password"></div>
+    <button class="btn" onclick="doRegister()" id="registerBtn">Create account →</button>
+  </div>
+
+  <div class="msg" id="msgBox"></div>
+
+  <!-- ZERODHA CONNECT (shown after login) -->
+  <div class="kite-section" id="kiteSection">
+    <div class="kite-head">
+      <span>🔗 Connect Zerodha</span>
+      <span class="kite-status ks-no" id="kiteStatus">Not connected</span>
+    </div>
+    <div style="font-size:11px;color:var(--t3);margin-bottom:10px;font-family:'IBM Plex Mono',monospace;line-height:1.6">
+      Get your API key from <a href="https://developers.kite.trade" target="_blank" style="color:#4080ff">developers.kite.trade</a><br>
+      Set redirect URL to: <strong style="color:#f0a500">http://localhost:8000/kite/callback</strong>
+    </div>
+    <div class="kite-fields">
+      <div><label style="font-size:10px;color:var(--t3);font-family:'IBM Plex Mono',monospace;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;display:block">API key</label>
+      <input type="text" id="kApiKey" style="width:100%;background:var(--s3);border:1px solid var(--b2);border-radius:6px;padding:8px 10px;color:var(--tx);font-size:12px;font-family:'IBM Plex Mono',monospace;outline:none" placeholder="kitexxx..."></div>
+      <div><label style="font-size:10px;color:var(--t3);font-family:'IBM Plex Mono',monospace;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;display:block">API secret</label>
+      <input type="password" id="kSecret" style="width:100%;background:var(--s3);border:1px solid var(--b2);border-radius:6px;padding:8px 10px;color:var(--tx);font-size:12px;font-family:'IBM Plex Mono',monospace;outline:none" placeholder="secretxxx..."></div>
+    </div>
+    <button class="kite-btn" onclick="saveKiteKeys()">Save API key</button>
+    <button class="kite-btn" onclick="connectZerodha()" style="margin-top:6px;background:rgba(245,166,35,.15)">Open Zerodha login →</button>
+  </div>
+
+  <div class="footer">
+    By continuing you agree to the <a href="#">ASOS Terms</a>
+  </div>
+</div>
+
+<script>
+const API = 'http://localhost:8000';
+let _token = null;
+
+function showTab(t) {
+  document.getElementById('loginForm').style.display    = t === 'login'    ? '' : 'none';
+  document.getElementById('registerForm').style.display = t === 'register' ? '' : 'none';
+  document.getElementById('tabLogin').classList.toggle('on',    t === 'login');
+  document.getElementById('tabRegister').classList.toggle('on', t === 'register');
+  hideMsg();
+}
+function showMsg(txt, type='err') {
+  const el = document.getElementById('msgBox');
+  el.textContent = txt;
+  el.className = 'msg visible ' + type;
+}
+function hideMsg() {
+  document.getElementById('msgBox').className = 'msg';
+}
+
+async function doLogin() {
+  const email = document.getElementById('lEmail').value.trim();
+  const pass  = document.getElementById('lPass').value;
+  if (!email || !pass) { showMsg('Please enter email and password.'); return; }
+  document.getElementById('loginBtn').disabled = true;
+  try {
+    const r = await fetch(`${API}/auth/login`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({email, password: pass})
+    });
+    const d = await r.json();
+    if (!r.ok) { showMsg(d.detail || 'Login failed.'); return; }
+    onSuccess(d);
+  } catch(e) {
+    showMsg('Cannot reach server. Make sure backend is running: uvicorn main:app --reload');
+  } finally {
+    document.getElementById('loginBtn').disabled = false;
+  }
+}
+
+async function doRegister() {
+  const name  = document.getElementById('rName').value.trim();
+  const email = document.getElementById('rEmail').value.trim();
+  const pass  = document.getElementById('rPass').value;
+  if (!email || pass.length < 6) { showMsg('Valid email + password (min 6 chars) required.'); return; }
+  document.getElementById('registerBtn').disabled = true;
+  try {
+    const r = await fetch(`${API}/auth/register`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({email, password: pass, name})
+    });
+    const d = await r.json();
+    if (!r.ok) { showMsg(d.detail || 'Registration failed.'); return; }
+    onSuccess(d);
+  } catch(e) {
+    showMsg('Cannot reach server. Is uvicorn running on port 8000?');
+  } finally {
+    document.getElementById('registerBtn').disabled = false;
+  }
+}
+
+function demoLogin() {
+  document.getElementById('lEmail').value = 'demo@asos.wealth';
+  document.getElementById('lPass').value  = 'demo1234';
+  doLogin();
+}
+
+function onSuccess(data) {
+  _token = data.access_token;
+  localStorage.setItem('asos_token', _token);
+  localStorage.setItem('asos_user', JSON.stringify(data.user));
+  showMsg(`Welcome back, ${data.user.name || data.user.email}! Redirecting…`, 'ok');
+  checkKiteStatus();
+  document.getElementById('kiteSection').classList.add('visible');
+  setTimeout(() => { window.location.href = '/static/app.html'; }, 1500);
+}
+
+async function checkKiteStatus() {
+  if (!_token) return;
+  try {
+    const r = await fetch(`${API}/kite/status`, {
+      headers: {'Authorization': `Bearer ${_token}`}
+    });
+    const d = await r.json();
+    const el = document.getElementById('kiteStatus');
+    if (d.connected) {
+      el.textContent = 'Connected ✓';
+      el.className = 'kite-status ks-yes';
+    }
+  } catch {}
+}
+
+async function saveKiteKeys() {
+  if (!_token) { showMsg('Please log in first.'); return; }
+  const api_key    = document.getElementById('kApiKey').value.trim();
+  const api_secret = document.getElementById('kSecret').value.trim();
+  if (!api_key || !api_secret) { showMsg('Enter both API key and secret.'); return; }
+  try {
+    await fetch(`${API}/kite/setup`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json','Authorization': `Bearer ${_token}`},
+      body: JSON.stringify({api_key, api_secret})
+    });
+    showMsg('API keys saved! Now click "Open Zerodha login".', 'ok');
+  } catch(e) { showMsg('Save failed.'); }
+}
+
+async function connectZerodha() {
+  if (!_token) { showMsg('Log in first.'); return; }
+  try {
+    const r = await fetch(`${API}/kite/login-url`, {
+      headers: {'Authorization': `Bearer ${_token}`}
+    });
+    const d = await r.json();
+    if (d.login_url) {
+      window.open(d.login_url, '_blank', 'width=500,height=700');
+    } else {
+      showMsg(d.detail || 'Set API key first.');
+    }
+  } catch(e) { showMsg('Error. Is backend running?'); }
+}
+
+// Auto-redirect if already logged in
+const saved = localStorage.getItem('asos_token');
+if (saved) {
+  fetch(`${API}/auth/me`, {headers: {'Authorization': `Bearer ${saved}`}})
+    .then(r => r.ok ? window.location.href = '/static/app.html' : null)
+    .catch(() => null);
+}
+
+// Check URL params
+const params = new URLSearchParams(window.location.search);
+if (params.get('error') === 'kite_failed') showMsg('Zerodha connection failed. Try again.');
+document.getElementById('lEmail').addEventListener('keydown', e => e.key === 'Enter' && doLogin());
+document.getElementById('lPass').addEventListener('keydown',  e => e.key === 'Enter' && doLogin());
+</script>
+</body>
+</html>
